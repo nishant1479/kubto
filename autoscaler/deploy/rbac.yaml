@@ -1,0 +1,98 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# RBAC — Intelligent Kubernetes Node Autoscaler
+#
+# Minimal permission set required for the controller to:
+#   • Watch pods and nodes via informers
+#   • Evict pods during drain (policy/v1 Eviction API)
+#   • Cordon and delete nodes
+#   • Emit Kubernetes events for observability
+#   • Respect PodDisruptionBudgets during drain
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── ServiceAccount ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kuber-scale-autoscaler
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: kuber-scale-autoscaler
+    app.kubernetes.io/component: autoscaler
+
+---
+# ── ClusterRole ───────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kuber-scale-autoscaler
+  labels:
+    app.kubernetes.io/name: kuber-scale-autoscaler
+    app.kubernetes.io/component: autoscaler
+rules:
+
+  # ── Pods ─────────────────────────────────────────────────────────────────────
+  # Required by: PodWatcher informer, drain pod listing, idle-node pod check,
+  #              critical-pod checker.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # ── Pod eviction (core group sub-resource) ────────────────────────────────
+  # Required by: NodeDrainer.evictPod → client.CoreV1().Pods().EvictV1()
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+
+  # ── Pod eviction (policy/v1 — Kubernetes ≥ 1.22) ─────────────────────────
+  # Required by: NodeDrainer.evictPod → policy/v1 Eviction object
+  - apiGroups: ["policy"]
+    resources: ["evictions"]
+    verbs: ["create"]
+
+  # ── PodDisruptionBudgets ───────────────────────────────────────────────────
+  # Required by: Eviction API — the API server validates PDB compliance when
+  #              processing an eviction request; the controller reads PDBs to
+  #              understand why 429 responses are returned.
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+
+  # ── Nodes ─────────────────────────────────────────────────────────────────
+  # Required by: NodeWatcher informer (get/list/watch),
+  #              CordonNode (update),
+  #              NodeCleanup.Cleanup (delete),
+  #              KindNodeProvisioner.annotateNode (update).
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+
+  # ── Node status ───────────────────────────────────────────────────────────
+  # Required by: WaitForNodeReady — reads node.Status.Conditions.
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["get", "list", "watch"]
+
+  # ── Events ───────────────────────────────────────────────────────────────
+  # Required by: controller event recording for audit and observability.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+
+---
+# ── ClusterRoleBinding ────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kuber-scale-autoscaler
+  labels:
+    app.kubernetes.io/name: kuber-scale-autoscaler
+    app.kubernetes.io/component: autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: kuber-scale-autoscaler
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: kuber-scale-autoscaler
+  apiGroup: rbac.authorization.k8s.io
