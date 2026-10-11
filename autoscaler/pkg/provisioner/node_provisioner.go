@@ -58,6 +58,8 @@ type NodeProvisioner interface {
 	CreateNode(ctx context.Context) (string, error)
 	// CordonNode marks a node unschedulable before draining.
 	CordonNode(ctx context.Context, name string) error
+	// TerminateNode destroys the underlying infrastructure resource for the node (e.g. Docker container, VM).
+	TerminateNode(ctx context.Context, name string) error
 }
 
 // ─── KindNodeProvisioner ──────────────────────────────────────────────────────
@@ -330,6 +332,12 @@ func (p *KindNodeProvisioner) annotateNode(ctx context.Context, nodeName string)
 	node.Annotations[utils.AnnotationScaledAt] = time.Now().UTC().Format(time.RFC3339)
 	_, err = p.Client.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 	return err
+}
+
+// TerminateNode implements NodeProvisioner. It removes the underlying Kind
+// Docker container backing the worker node.
+func (p *KindNodeProvisioner) TerminateNode(ctx context.Context, name string) error {
+	return p.removeContainer(name)
 }
 
 // removeContainer removes a Docker container by name (used for cleanup on
