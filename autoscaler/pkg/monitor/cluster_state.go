@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -29,6 +30,17 @@ type PodInfo struct {
 	// ConditionMessage is the human-readable Message from the PodScheduled
 	// condition, used to classify the type of shortage.
 	ConditionMessage string
+	// NodeName is the node this pod is bound/scheduled to, if any.
+	NodeName string
+	// NodeSelector defines the pod's explicit node-selector requirements.
+	NodeSelector map[string]string
+	// Tolerations are the pod's tolerations for node taints.
+	Tolerations []corev1.Toleration
+	// HasUnsupportedConstraints is set to true when the pod uses scheduling
+	// rules Kubto does not support (e.g. pod anti-affinity, topology spread).
+	HasUnsupportedConstraints bool
+	// UnsupportedReason details which constraint is unsupported.
+	UnsupportedReason string
 }
 
 // NodeInfo holds the capacity and current usage for a single node.
@@ -50,6 +62,10 @@ type NodeInfo struct {
 	// CreatedAt is the node's creation timestamp, used to enforce the minimum
 	// node-age requirement before a node is eligible for scale-down.
 	CreatedAt time.Time
+	// Labels are the node's metadata labels used for nodeSelector matching.
+	Labels map[string]string
+	// Taints are the node's taints checked against pod tolerations.
+	Taints []corev1.Taint
 }
 
 // ─── ClusterState ─────────────────────────────────────────────────────────────
@@ -60,9 +76,10 @@ type NodeInfo struct {
 // Callers MUST use the accessor methods; they must NOT access the unexported
 // fields directly.
 type ClusterState struct {
-	mu          sync.RWMutex
-	PendingPods []PodInfo
-	Nodes       []NodeInfo
+	mu            sync.RWMutex
+	PendingPods   []PodInfo
+	ScheduledPods []PodInfo
+	Nodes         []NodeInfo
 }
 
 // NewClusterState returns an empty, ready-to-use ClusterState.
@@ -79,24 +96,94 @@ func (cs *ClusterState) SetPendingPods(pods []PodInfo) {
 	cs.PendingPods = pods
 }
 
+// SetScheduledPods atomically replaces scheduled pods and recomputes node usage.
+func (cs *ClusterState) SetScheduledPods(pods []PodInfo) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.ScheduledPods = pods
+	cs.recomputeNodeUsageLocked()
+}
+
+// SetPods atomically updates both pending and scheduled pods and recomputes node usage.
+func (cs *ClusterState) SetPods(pending, scheduled []PodInfo) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.PendingPods = pending
+	cs.ScheduledPods = scheduled
+	cs.recomputeNodeUsageLocked()
+}
+
 // SetNodes atomically replaces the full node list.
 func (cs *ClusterState) SetNodes(nodes []NodeInfo) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	cs.Nodes = nodes
+	if len(cs.ScheduledPods) > 0 {
+		cs.recomputeNodeUsageLocked()
+	}
+}
+
+// recomputeNodeUsageLocked calculates per-node UsedCPU and UsedMemory by summing
+// requests of non-terminal pods scheduled on that node. Caller must hold cs.mu.
+func (cs *ClusterState) recomputeNodeUsageLocked() {
+	if len(cs.ScheduledPods) == 0 {
+		return
+	}
+	cpuMap := make(map[string]*resource.Quantity)
+	memMap := make(map[string]*resource.Quantity)
+
+	for _, p := range cs.ScheduledPods {
+		if p.NodeName == "" {
+			continue
+		}
+		if _, ok := cpuMap[p.NodeName]; !ok {
+			cpuMap[p.NodeName] = resource.NewMilliQuantity(0, resource.DecimalSI)
+			memMap[p.NodeName] = resource.NewQuantity(0, resource.BinarySI)
+		}
+		cpuMap[p.NodeName].Add(p.CPURequest)
+		memMap[p.NodeName].Add(p.MemoryRequest)
+	}
+
+	for i := range cs.Nodes {
+		name := cs.Nodes[i].Name
+		if cpu, ok := cpuMap[name]; ok {
+			cs.Nodes[i].UsedCPU = *cpu
+		} else {
+			cs.Nodes[i].UsedCPU = *resource.NewMilliQuantity(0, resource.DecimalSI)
+		}
+		if mem, ok := memMap[name]; ok {
+			cs.Nodes[i].UsedMemory = *mem
+		} else {
+			cs.Nodes[i].UsedMemory = *resource.NewQuantity(0, resource.BinarySI)
+		}
+	}
 }
 
 // UpdateNode inserts or replaces a single node entry identified by name.
 func (cs *ClusterState) UpdateNode(node NodeInfo) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+	found := false
 	for i, n := range cs.Nodes {
 		if n.Name == node.Name {
+			// Preserve computed usage if not explicitly supplied
+			if node.UsedCPU.IsZero() && !n.UsedCPU.IsZero() {
+				node.UsedCPU = n.UsedCPU
+			}
+			if node.UsedMemory.IsZero() && !n.UsedMemory.IsZero() {
+				node.UsedMemory = n.UsedMemory
+			}
 			cs.Nodes[i] = node
-			return
+			found = true
+			break
 		}
 	}
-	cs.Nodes = append(cs.Nodes, node)
+	if !found {
+		cs.Nodes = append(cs.Nodes, node)
+	}
+	if len(cs.ScheduledPods) > 0 {
+		cs.recomputeNodeUsageLocked()
+	}
 }
 
 // RemoveNode removes the node with the given name from the state.
@@ -120,6 +207,15 @@ func (cs *ClusterState) GetPendingPods() []PodInfo {
 	defer cs.mu.RUnlock()
 	out := make([]PodInfo, len(cs.PendingPods))
 	copy(out, cs.PendingPods)
+	return out
+}
+
+// GetScheduledPods returns a shallow copy of the current scheduled-pod list.
+func (cs *ClusterState) GetScheduledPods() []PodInfo {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	out := make([]PodInfo, len(cs.ScheduledPods))
+	copy(out, cs.ScheduledPods)
 	return out
 }
 

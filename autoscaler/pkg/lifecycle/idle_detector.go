@@ -20,7 +20,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/kuber-scale/autoscaler/pkg/monitor"
-	"github.com/kuber-scale/autoscaler/pkg/utils"
 )
 
 // ─── NodeLifecycleManager ─────────────────────────────────────────────────────
@@ -229,11 +228,9 @@ func isDaemonSetPod(pod corev1.Pod) bool {
 }
 
 // isStaticPod returns true for mirror (static) pods.
+// Static pods are identified by the "kubernetes.io/config.mirror" annotation
+// set by the kubelet. They cannot be evicted via the API server.
 func isStaticPod(pod corev1.Pod) bool {
-	_, ok := pod.Annotations[utils.AnnotationManagedBy]
-	if ok {
-		return false // our pods, not static
-	}
-	_, ok = pod.Annotations["kubernetes.io/config.mirror"]
+	_, ok := pod.Annotations["kubernetes.io/config.mirror"]
 	return ok
 }

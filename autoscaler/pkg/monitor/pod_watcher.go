@@ -60,26 +60,36 @@ func (pw *PodWatcher) HasSynced() bool {
 	return pw.controller.HasSynced()
 }
 
-// sync rebuilds the PendingPods list from the informer's local cache.
+// sync rebuilds the PendingPods and ScheduledPods lists from the informer's local cache.
 // It is safe to call concurrently from multiple goroutines.
 func (pw *PodWatcher) sync() {
 	items := pw.store.List()
-	pods := make([]PodInfo, 0, len(items))
+	pendingPods := make([]PodInfo, 0, len(items))
+	scheduledPods := make([]PodInfo, 0, len(items))
 
 	for _, obj := range items {
 		pod, ok := obj.(*corev1.Pod)
 		if !ok {
 			continue
 		}
-		// Only track pods that Kubernetes reports as Pending.
-		if pod.Status.Phase != corev1.PodPending {
-			continue
+		info := podToInfo(pod)
+
+		// 1. Pending pods: evaluated for scale-up demand.
+		if pod.Status.Phase == corev1.PodPending {
+			pendingPods = append(pendingPods, info)
 		}
-		pods = append(pods, podToInfo(pod))
+
+		// 2. Scheduled pods: non-terminal pods bound to a node consume node capacity.
+		if pod.Spec.NodeName != "" &&
+			pod.Status.Phase != corev1.PodSucceeded &&
+			pod.Status.Phase != corev1.PodFailed {
+			scheduledPods = append(scheduledPods, info)
+		}
 	}
 
-	pw.state.SetPendingPods(pods)
-	log.Printf("[PodWatcher] cache synced — %d pending pod(s)", len(pods))
+	pw.state.SetPods(pendingPods, scheduledPods)
+	log.Printf("[PodWatcher] cache synced — %d pending pod(s), %d scheduled pod(s)",
+		len(pendingPods), len(scheduledPods))
 }
 
 // ─── Pod → PodInfo conversion ─────────────────────────────────────────────────
@@ -90,7 +100,7 @@ func podToInfo(pod *corev1.Pod) PodInfo {
 	memReq := resource.Quantity{}
 
 	// Aggregate requests across all containers (init containers are ignored
-	// because they do not run simultaneously).
+	// because they do not run simultaneously with app containers).
 	for _, c := range pod.Spec.Containers {
 		if v, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
 			cpuReq.Add(v)
@@ -110,13 +120,38 @@ func podToInfo(pod *corev1.Pod) PodInfo {
 		}
 	}
 
+	var hasUnsupported bool
+	var unsupportedReason string
+	if pod.Spec.Affinity != nil {
+		if pod.Spec.Affinity.PodAffinity != nil {
+			hasUnsupported = true
+			unsupportedReason = "podAffinity is unsupported"
+		} else if pod.Spec.Affinity.PodAntiAffinity != nil {
+			hasUnsupported = true
+			unsupportedReason = "podAntiAffinity is unsupported"
+		} else if pod.Spec.Affinity.NodeAffinity != nil &&
+			pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+			hasUnsupported = true
+			unsupportedReason = "nodeAffinity required rules unsupported"
+		}
+	}
+	if len(pod.Spec.TopologySpreadConstraints) > 0 {
+		hasUnsupported = true
+		unsupportedReason = "topologySpreadConstraints unsupported"
+	}
+
 	return PodInfo{
-		Name:             pod.Name,
-		Namespace:        pod.Namespace,
-		CPURequest:       cpuReq,
-		MemoryRequest:    memReq,
-		Status:           string(pod.Status.Phase),
-		ConditionReason:  condReason,
-		ConditionMessage: condMessage,
+		Name:                      pod.Name,
+		Namespace:                 pod.Namespace,
+		CPURequest:                cpuReq,
+		MemoryRequest:             memReq,
+		Status:                    string(pod.Status.Phase),
+		ConditionReason:           condReason,
+		ConditionMessage:          condMessage,
+		NodeName:                  pod.Spec.NodeName,
+		NodeSelector:              pod.Spec.NodeSelector,
+		Tolerations:               pod.Spec.Tolerations,
+		HasUnsupportedConstraints: hasUnsupported,
+		UnsupportedReason:         unsupportedReason,
 	}
 }

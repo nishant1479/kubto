@@ -95,13 +95,13 @@ func nodeToInfo(node *corev1.Node) NodeInfo {
 		Name:              node.Name,
 		AllocatableCPU:    allocCPU,
 		AllocatableMemory: allocMem,
-		// Usage is computed by the estimator from pod requests, not node metrics,
-		// so we seed with zero here.
-		UsedCPU:       *resource.NewMilliQuantity(0, resource.DecimalSI),
-		UsedMemory:    *resource.NewQuantity(0, resource.BinarySI),
-		Ready:         isReady(node),
-		Unschedulable: node.Spec.Unschedulable,
-		CreatedAt:     node.CreationTimestamp.Time,
+		UsedCPU:           *resource.NewMilliQuantity(0, resource.DecimalSI),
+		UsedMemory:        *resource.NewQuantity(0, resource.BinarySI),
+		Ready:             isReady(node),
+		Unschedulable:     node.Spec.Unschedulable,
+		CreatedAt:         node.CreationTimestamp.Time,
+		Labels:            node.Labels,
+		Taints:            node.Spec.Taints,
 	}
 }
 
