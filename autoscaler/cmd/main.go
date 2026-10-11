@@ -5,10 +5,13 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -21,6 +24,10 @@ func main() {
 	kubeconfig := flag.String(
 		"kubeconfig", "",
 		"Absolute path to a kubeconfig file. Leave empty to use in-cluster config.",
+	)
+	metricsAddr := flag.String(
+		"metrics-addr", ":8080",
+		"TCP address for Prometheus /metrics and /healthz endpoint. Set to empty string to disable.",
 	)
 	flag.Parse()
 
@@ -39,6 +46,36 @@ func main() {
 	// signal.NotifyContext cancels the context when SIGINT or SIGTERM is received.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// ── Metrics HTTP Server ────────────────────────────────────────────────
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+
+		server := &http.Server{
+			Addr:              *metricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+
+		go func() {
+			log.Printf("[main] metrics HTTP server listening on %s (/metrics, /healthz)", *metricsAddr)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[main] metrics server error: %v", err)
+			}
+		}()
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = server.Shutdown(shutdownCtx)
+		}()
+	}
 
 	// ── Controller ─────────────────────────────────────────────────────────
 	ctrl := controller.NewAutoscalerController(client)
