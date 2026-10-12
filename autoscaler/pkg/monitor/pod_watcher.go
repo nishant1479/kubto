@@ -7,7 +7,6 @@ import (
 	"log"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -72,7 +71,7 @@ func (pw *PodWatcher) sync() {
 		if !ok {
 			continue
 		}
-		info := podToInfo(pod)
+		info := PodToInfo(pod)
 
 		// 1. Pending pods: evaluated for scale-up demand.
 		if pod.Status.Phase == corev1.PodPending {
@@ -94,23 +93,15 @@ func (pw *PodWatcher) sync() {
 
 // ─── Pod → PodInfo conversion ─────────────────────────────────────────────────
 
-// podToInfo extracts scheduling-relevant fields from a corev1.Pod.
-func podToInfo(pod *corev1.Pod) PodInfo {
-	cpuReq := resource.Quantity{}
-	memReq := resource.Quantity{}
-
-	// Aggregate requests across all containers (init containers are ignored
-	// because they do not run simultaneously with app containers).
-	for _, c := range pod.Spec.Containers {
-		if v, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
-			cpuReq.Add(v)
-		}
-		if v, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
-			memReq.Add(v)
-		}
+// PodToInfo extracts scheduling-relevant fields from a corev1.Pod.
+// It never mutates the source Pod (informer-owned objects must stay read-only).
+func PodToInfo(pod *corev1.Pod) PodInfo {
+	if pod == nil {
+		return PodInfo{}
 	}
 
-	// Extract the PodScheduled condition for scheduling diagnostics.
+	cpuReq, memReq := podEffectiveRequests(pod)
+
 	var condReason, condMessage string
 	for _, cond := range pod.Status.Conditions {
 		if cond.Type == corev1.PodScheduled {
@@ -149,8 +140,8 @@ func podToInfo(pod *corev1.Pod) PodInfo {
 		ConditionReason:           condReason,
 		ConditionMessage:          condMessage,
 		NodeName:                  pod.Spec.NodeName,
-		NodeSelector:              pod.Spec.NodeSelector,
-		Tolerations:               pod.Spec.Tolerations,
+		NodeSelector:              copyStringMap(pod.Spec.NodeSelector),
+		Tolerations:               copyTolerations(pod.Spec.Tolerations),
 		HasUnsupportedConstraints: hasUnsupported,
 		UnsupportedReason:         unsupportedReason,
 	}

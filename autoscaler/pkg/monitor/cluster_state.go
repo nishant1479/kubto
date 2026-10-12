@@ -18,9 +18,11 @@ type PodInfo struct {
 	Name string
 	// Namespace is the pod's metadata namespace.
 	Namespace string
-	// CPURequest is the sum of CPU requests across all containers.
+	// CPURequest is the Kubernetes scheduling-effective CPU request
+	// (regular containers, init/sidecar semantics, and Pod overhead).
 	CPURequest resource.Quantity
-	// MemoryRequest is the sum of memory requests across all containers.
+	// MemoryRequest is the Kubernetes scheduling-effective memory request
+	// (regular containers, init/sidecar semantics, and Pod overhead).
 	MemoryRequest resource.Quantity
 	// Status is the pod phase as a string (e.g. "Pending").
 	Status string

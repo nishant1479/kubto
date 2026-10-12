@@ -139,7 +139,7 @@ func TestPodToInfo_ConstraintsAndUnsupportedRules(t *testing.T) {
 		},
 	}
 
-	info := podToInfo(pod)
+	info := PodToInfo(pod)
 	if info.NodeSelector["disk"] != "ssd" || info.NodeSelector["zone"] != "us-east-1a" {
 		t.Errorf("expected nodeSelector copied, got %v", info.NodeSelector)
 	}
@@ -155,7 +155,7 @@ func TestPodToInfo_ConstraintsAndUnsupportedRules(t *testing.T) {
 	podAnti.Spec.Affinity = &corev1.Affinity{
 		PodAntiAffinity: &corev1.PodAntiAffinity{},
 	}
-	infoAnti := podToInfo(podAnti)
+	infoAnti := PodToInfo(podAnti)
 	if !infoAnti.HasUnsupportedConstraints {
 		t.Error("pod with podAntiAffinity should be marked as having unsupported constraints")
 	}
@@ -165,7 +165,7 @@ func TestPodToInfo_ConstraintsAndUnsupportedRules(t *testing.T) {
 	podTopo.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{
 		{MaxSkew: 1, TopologyKey: "zone", WhenUnsatisfiable: corev1.DoNotSchedule},
 	}
-	infoTopo := podToInfo(podTopo)
+	infoTopo := PodToInfo(podTopo)
 	if !infoTopo.HasUnsupportedConstraints {
 		t.Error("pod with topology spread should be marked as having unsupported constraints")
 	}
