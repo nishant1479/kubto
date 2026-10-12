@@ -18,6 +18,7 @@ type Metrics struct {
 	PendingPods            prometheus.Gauge
 	ActiveNodes            prometheus.Gauge
 	EstimatedRequiredNodes prometheus.Gauge
+	InfeasiblePods         prometheus.Gauge
 
 	ScaleUpTotal         prometheus.Counter
 	ScaleDownTotal       prometheus.Counter
@@ -56,6 +57,11 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 		EstimatedRequiredNodes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "kubto_estimated_required_nodes",
 			Help: "Estimated number of nodes required to satisfy pending pod demand.",
+		}),
+
+		InfeasiblePods: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kubto_infeasible_pods",
+			Help: "Current number of pending pods that cannot be satisfied by the single worker template or supported constraints.",
 		}),
 
 		ScaleUpTotal: prometheus.NewCounter(prometheus.CounterOpts{
@@ -110,6 +116,7 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 		m.PendingPods,
 		m.ActiveNodes,
 		m.EstimatedRequiredNodes,
+		m.InfeasiblePods,
 		m.ScaleUpTotal,
 		m.ScaleDownTotal,
 		m.NodesProvisionedTotal,
@@ -151,6 +158,10 @@ func (m *Metrics) SetActiveNodes(count int) {
 
 func (m *Metrics) SetEstimatedRequiredNodes(count int) {
 	m.EstimatedRequiredNodes.Set(float64(count))
+}
+
+func (m *Metrics) SetInfeasiblePods(count int) {
+	m.InfeasiblePods.Set(float64(count))
 }
 
 func (m *Metrics) IncScaleUp() {

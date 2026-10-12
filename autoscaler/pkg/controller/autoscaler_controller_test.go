@@ -302,3 +302,147 @@ func TestController_GaugesUpdatedDuringReconcile(t *testing.T) {
 		t.Errorf("PendingPods gauge want 0, got %v", v)
 	}
 }
+
+func unschedPod(name string, cpuM, memMiB int64) monitor.PodInfo {
+	return monitor.PodInfo{
+		Name:             name,
+		Namespace:        "default",
+		CPURequest:       mCPU(cpuM),
+		MemoryRequest:    miB(memMiB),
+		Status:           "Pending",
+		ConditionReason:  utils.UnschedulableReason,
+		ConditionMessage: utils.InsufficientCPUMsg,
+	}
+}
+
+func readyWorker(name string, cpuAlloc, cpuUsed int64) monitor.NodeInfo {
+	return monitor.NodeInfo{
+		Name:              name,
+		AllocatableCPU:    mCPU(cpuAlloc),
+		AllocatableMemory: miB(4096),
+		UsedCPU:           mCPU(cpuUsed),
+		UsedMemory:        miB(1024),
+		Ready:             true,
+	}
+}
+
+func TestController_FitsExistingCapacity_NoScaleUp(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctrl := NewAutoscalerController(client)
+	fakeProv := provisioner.NewFakeProvisioner()
+	ctrl.SetProvisioner(fakeProv)
+	ctrl.SetScaleUpCooldown(0)
+
+	ctrl.state.SetNodes([]monitor.NodeInfo{readyWorker("node-1", 8000, 100)})
+	ctrl.state.SetPendingPods([]monitor.PodInfo{unschedPod("pod-1", 500, 128)})
+
+	ctrl.Reconcile(context.Background())
+	if fakeProv.CreateCount() != 0 {
+		t.Fatalf("expected no scale-up when pod fits existing capacity, got %d", fakeProv.CreateCount())
+	}
+}
+
+func TestController_InfeasiblePod_NoProvisionLoop(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctrl := NewAutoscalerController(client)
+	reg := prometheus.NewRegistry()
+	m := metrics.NewMetrics(reg)
+	ctrl.SetMetrics(m)
+	fakeProv := provisioner.NewFakeProvisioner()
+	ctrl.SetProvisioner(fakeProv)
+	ctrl.SetScaleUpCooldown(0)
+
+	ctrl.state.SetNodes([]monitor.NodeInfo{readyWorker("node-1", 2000, 0)})
+	ctrl.state.SetPendingPods([]monitor.PodInfo{unschedPod("huge", 8000, 512)})
+
+	for i := 0; i < 5; i++ {
+		ctrl.Reconcile(context.Background())
+	}
+	if fakeProv.CreateAttempts() != 0 {
+		t.Fatalf("infeasible pod must not trigger provisioning, attempts=%d", fakeProv.CreateAttempts())
+	}
+	if v := getMetricGauge(m.InfeasiblePods); v != 1 {
+		t.Errorf("InfeasiblePods gauge want 1, got %v", v)
+	}
+	if v := getMetricGauge(m.EstimatedRequiredNodes); v != 0 {
+		t.Errorf("EstimatedRequiredNodes want 0, got %v", v)
+	}
+}
+
+func TestController_UnsupportedConstraint_NotTreatedSchedulable(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctrl := NewAutoscalerController(client)
+	fakeProv := provisioner.NewFakeProvisioner()
+	ctrl.SetProvisioner(fakeProv)
+	ctrl.SetScaleUpCooldown(0)
+
+	pod := unschedPod("anti", 1800, 512)
+	pod.HasUnsupportedConstraints = true
+	pod.UnsupportedReason = "podAntiAffinity is unsupported"
+
+	ctrl.state.SetNodes([]monitor.NodeInfo{readyWorker("node-1", 2000, 1900)})
+	ctrl.state.SetPendingPods([]monitor.PodInfo{pod})
+
+	ctrl.Reconcile(context.Background())
+	if fakeProv.CreateCount() != 0 {
+		t.Fatalf("unsupported constraint must not cause scale-up, created=%d", fakeProv.CreateCount())
+	}
+}
+
+func TestController_AtMaxNodes_NoProvisioning(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctrl := NewAutoscalerController(client)
+	fakeProv := provisioner.NewFakeProvisioner()
+	ctrl.SetProvisioner(fakeProv)
+	ctrl.SetScaleUpCooldown(0)
+
+	nodes := make([]monitor.NodeInfo, 5)
+	for i := 0; i < 5; i++ {
+		nodes[i] = readyWorker("n"+string(rune('1'+i)), 2000, 1900)
+	}
+	ctrl.state.SetNodes(nodes)
+	ctrl.state.SetPendingPods([]monitor.PodInfo{unschedPod("pod-1", 1500, 512)})
+
+	ctrl.Reconcile(context.Background())
+	if fakeProv.CreateCount() != 0 {
+		t.Fatalf("expected no provisioning at MaxNodes, got %d", fakeProv.CreateCount())
+	}
+}
+
+func TestController_ScaleUpCooldownHonored(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctrl := NewAutoscalerController(client)
+	fakeProv := provisioner.NewFakeProvisioner()
+	ctrl.SetProvisioner(fakeProv)
+	ctrl.SetScaleUpCooldown(time.Hour)
+
+	ctrl.state.SetNodes([]monitor.NodeInfo{readyWorker("node-1", 2000, 1800)})
+	ctrl.state.SetPendingPods([]monitor.PodInfo{unschedPod("pod-1", 1000, 512)})
+
+	ctrl.Reconcile(context.Background())
+	if fakeProv.CreateCount() != 1 {
+		t.Fatalf("first reconcile should provision, got %d", fakeProv.CreateCount())
+	}
+	ctrl.Reconcile(context.Background())
+	if fakeProv.CreateCount() != 1 {
+		t.Fatalf("cooldown should suppress second provision, got %d", fakeProv.CreateCount())
+	}
+}
+
+func TestController_RestartWithJoiningNode_NoDuplicate(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctrl := NewAutoscalerController(client)
+	fakeProv := provisioner.NewFakeProvisioner()
+	ctrl.SetProvisioner(fakeProv)
+	ctrl.SetScaleUpCooldown(0)
+
+	ctrl.state.SetNodes([]monitor.NodeInfo{
+		readyWorker("node-1", 2000, 1800),
+		{Name: "joining", AllocatableCPU: mCPU(2000), AllocatableMemory: miB(4096), Ready: false},
+	})
+	ctrl.state.SetPendingPods([]monitor.PodInfo{unschedPod("pod-1", 1000, 512)})
+	ctrl.Reconcile(context.Background())
+	if fakeProv.CreateCount() != 0 {
+		t.Fatalf("joining node should suppress scale-up on restarted controller, got %d", fakeProv.CreateCount())
+	}
+}

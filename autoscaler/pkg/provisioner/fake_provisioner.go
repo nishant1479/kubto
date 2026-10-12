@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // FakeNodeProvisioner implements NodeProvisioner for testing.
@@ -29,8 +30,19 @@ type FakeNodeProvisioner struct {
 	// TerminatedNodes records nodes on which TerminateNode was called.
 	TerminatedNodes []string
 
-	// CreateError, when non-nil, is returned by every CreateNode call.
+	// CreateError, when non-nil, is returned by every CreateNode call
+	// (after FailAfter successful calls, if set).
 	CreateError error
+
+	// FailAfter, when > 0, lets the first FailAfter CreateNode calls succeed
+	// and returns CreateError (or a generic error) afterwards.
+	FailAfter int
+
+	// CreateDelay is slept (respecting ctx) before completing CreateNode.
+	CreateDelay time.Duration
+
+	// createAttempts counts every CreateNode invocation, including failures.
+	createAttempts int
 
 	// CordonError, when non-nil, is returned by every CordonNode call.
 	CordonError error
@@ -49,12 +61,36 @@ func NewFakeProvisioner() *FakeNodeProvisioner {
 
 // CreateNode records the call and returns a unique fake node name, or
 // CreateError if set.
-func (f *FakeNodeProvisioner) CreateNode(_ context.Context) (string, error) {
+func (f *FakeNodeProvisioner) CreateNode(ctx context.Context) (string, error) {
+	f.mu.Lock()
+	delay := f.CreateDelay
+	failAfter := f.FailAfter
+	createErr := f.CreateError
+	already := len(f.CreatedNodes)
+	f.createAttempts++
+	f.mu.Unlock()
+
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.CreateError != nil {
-		return "", f.CreateError
+	if failAfter > 0 && already >= failAfter {
+		if createErr == nil {
+			createErr = fmt.Errorf("fake provisioner FailAfter=%d", failAfter)
+		}
+		return "", createErr
+	}
+	if createErr != nil && failAfter == 0 {
+		return "", createErr
 	}
 
 	n := f.counter.Add(1)
@@ -96,6 +132,13 @@ func (f *FakeNodeProvisioner) CreateCount() int {
 	return len(f.CreatedNodes)
 }
 
+// CreateAttempts returns the number of CreateNode invocations, including failures.
+func (f *FakeNodeProvisioner) CreateAttempts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createAttempts
+}
+
 // CordonCount returns the number of successful CordonNode calls recorded so far.
 func (f *FakeNodeProvisioner) CordonCount() int {
 	f.mu.Lock()
@@ -117,4 +160,5 @@ func (f *FakeNodeProvisioner) Reset() {
 	f.CreatedNodes = nil
 	f.CordonedNodes = nil
 	f.TerminatedNodes = nil
+	f.createAttempts = 0
 }

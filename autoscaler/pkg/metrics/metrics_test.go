@@ -45,6 +45,11 @@ func TestMetrics_GaugeUpdates(t *testing.T) {
 	if v := getGaugeValue(m.EstimatedRequiredNodes); v != 2 {
 		t.Errorf("EstimatedRequiredNodes want 2, got %v", v)
 	}
+
+	m.SetInfeasiblePods(4)
+	if v := getGaugeValue(m.InfeasiblePods); v != 4 {
+		t.Errorf("InfeasiblePods want 4, got %v", v)
+	}
 }
 
 func TestMetrics_CounterUpdates(t *testing.T) {

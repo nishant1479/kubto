@@ -228,27 +228,48 @@ func (c *AutoscalerController) reconcile(ctx context.Context) {
 
 		if c.metrics != nil {
 			c.metrics.SetEstimatedRequiredNodes(report.NodesNeeded)
+			c.metrics.SetInfeasiblePods(len(report.InfeasiblePods))
+		}
+		for name, reason := range report.InfeasiblePods {
+			log.Printf("[Controller] infeasible pod %s: %s", name, reason)
 		}
 
-		dec := c.decisionEngine.Decide(demand, state)
-		if c.metrics != nil {
-			if dec.ScaleUp {
-				c.metrics.RecordDecision("scale_up")
-			} else {
+		if report.NodesNeeded == 0 {
+			if c.metrics != nil {
 				c.metrics.RecordDecision("noop")
 			}
-		}
-
-		if dec.ScaleUp {
-			c.handleScaleUp(ctx, dec)
+			if len(report.InfeasiblePods) > 0 {
+				log.Printf("[Controller] %d infeasible pod(s) and no feasible template placement — skipping scale-up to avoid a provision loop",
+					len(report.InfeasiblePods))
+			} else {
+				log.Printf("[Controller] scale-up evaluation: no-op — pending pods fit existing capacity")
+			}
+			// Skip scale-down while unschedulable pods remain (even if infeasible).
 		} else {
-			log.Printf("[Controller] scale-up evaluation: no-op — %s", dec.Reason)
+			dec := c.decisionEngine.Decide(demand, state)
+			if c.metrics != nil {
+				if dec.ScaleUp {
+					c.metrics.RecordDecision("scale_up")
+				} else {
+					c.metrics.RecordDecision("noop")
+				}
+			}
+
+			if dec.ScaleUp {
+				if report.NodesNeeded < dec.Count {
+					dec.Count = report.NodesNeeded
+				}
+				c.handleScaleUp(ctx, dec)
+			} else {
+				log.Printf("[Controller] scale-up evaluation: no-op — %s", dec.Reason)
+			}
 		}
 	} else {
 		// ── Branch B: no pending pods — look for idle nodes to remove ─────────
 		log.Println("[Controller] no unschedulable pods — checking for idle nodes")
 		if c.metrics != nil {
 			c.metrics.SetEstimatedRequiredNodes(0)
+			c.metrics.SetInfeasiblePods(0)
 		}
 
 		idleNodes := c.lifecycleManager.FindIdleNodes(ctx, state)
