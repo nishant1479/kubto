@@ -90,8 +90,19 @@ func (e *ResourceEstimator) Estimate(
 	return report.Delta
 }
 
-// EstimateDetailed performs constraint-aware Best Fit Decreasing (BFD) bin-packing
-// and returns a full explainability report.
+// EstimateDetailed performs constraint-aware Best Fit Decreasing (BFD) heuristic
+// bin-packing and returns a full explainability report.
+//
+// BFD is a heuristic: it does not search for a globally optimal packing.
+// Capacity accounting distinguishes three quantities:
+//  1. initial free capacity on ready, schedulable existing nodes (snapshotted
+//     before any simulated placement);
+//  2. capacity consumed by placing pending pods onto those existing nodes;
+//  3. remaining deficit — resources that had to be placed on new template nodes.
+//
+// Delta is the remaining deficit (2 is excluded; infeasible pods are excluded).
+// NodesNeeded is the number of new template nodes the heuristic opened.
+// Kubto currently models a single homogeneous worker template.
 func (e *ResourceEstimator) EstimateDetailed(
 	state *monitor.ClusterState,
 	unschedulable []monitor.PodInfo,
@@ -133,6 +144,16 @@ func (e *ResourceEstimator) EstimateDetailed(
 		}
 	}
 
+	// Snapshot initial free capacity BEFORE placement mutates the bins.
+	var totalInitialFreeCPU, totalInitialFreeMem int64
+	for _, c := range candidates {
+		totalInitialFreeCPU += c.freeCPU
+		totalInitialFreeMem += c.freeMem
+	}
+	report.Explanations = append(report.Explanations,
+		fmt.Sprintf("initial free capacity across %d candidate node(s): %dm CPU, %d bytes RAM",
+			len(candidates), totalInitialFreeCPU, totalInitialFreeMem))
+
 	// ── 2. Filter and categorize unschedulable pods ──────────────────────────
 	type podCandidate struct {
 		info     monitor.PodInfo
@@ -142,8 +163,6 @@ func (e *ResourceEstimator) EstimateDetailed(
 	}
 
 	var feasible []podCandidate
-	var oversizedShortfallCPU int64
-	var oversizedShortfallMem int64
 
 	for _, p := range unschedulable {
 		cpuReq := p.CPURequest.MilliValue()
@@ -161,28 +180,6 @@ func (e *ResourceEstimator) EstimateDetailed(
 		if cpuReq == 0 && memReq == 0 {
 			report.PlacedPods[p.Name] = "zero-request (no capacity required)"
 			continue
-		}
-
-		// Check if pod is larger than any possible template node
-		if cpuReq > e.NodeCPUCapacityMillicores || memReq > e.NodeMemoryCapacityBytes {
-			// Can it fit on any existing node with larger allocatable capacity?
-			canFitExisting := false
-			for _, c := range candidates {
-				if cpuReq <= c.freeCPU && memReq <= c.freeMem {
-					canFitExisting = true
-					break
-				}
-			}
-			if !canFitExisting {
-				reason := fmt.Sprintf("pod requires %dm CPU / %d bytes RAM, exceeding template node capacity (%dm / %d bytes)",
-					cpuReq, memReq, e.NodeCPUCapacityMillicores, e.NodeMemoryCapacityBytes)
-				report.InfeasiblePods[p.Name] = reason
-				report.Explanations = append(report.Explanations, fmt.Sprintf("pod %s oversized: %s", p.Name, reason))
-				// Track shortfall for oversized pod so scale-up decision knows demand exists
-				oversizedShortfallCPU += cpuReq
-				oversizedShortfallMem += memReq
-				continue
-			}
 		}
 
 		// Calculate normalized score for sorting: max(CPU/templateCPU, Mem/templateMem)
@@ -208,10 +205,10 @@ func (e *ResourceEstimator) EstimateDetailed(
 
 	// ── 4. Bin-pack pods into existing nodes or simulate new nodes ──────────
 	var openNewNodes []*simulatedNode
+	var consumedExistingCPU, consumedExistingMem int64
 
 	for _, pc := range feasible {
 		p := pc.info
-		placed := false
 
 		// 4a. Try existing nodes first (Best Fit: node that leaves least remaining capacity)
 		var bestExisting *simulatedNode
@@ -233,11 +230,12 @@ func (e *ResourceEstimator) EstimateDetailed(
 		if bestExisting != nil {
 			bestExisting.freeCPU -= pc.cpuMilli
 			bestExisting.freeMem -= pc.memBytes
+			consumedExistingCPU += pc.cpuMilli
+			consumedExistingMem += pc.memBytes
 			report.PlacedPods[p.Name] = bestExisting.name
 			report.Explanations = append(report.Explanations,
 				fmt.Sprintf("pod %s fits on existing node %s (remaining free: %dm CPU, %dMiB RAM)",
 					p.Name, bestExisting.name, bestExisting.freeCPU, bestExisting.freeMem/(1024*1024)))
-			placed = true
 			continue
 		}
 
@@ -264,11 +262,18 @@ func (e *ResourceEstimator) EstimateDetailed(
 			report.PlacedPods[p.Name] = bestNew.name
 			report.Explanations = append(report.Explanations,
 				fmt.Sprintf("pod %s fits on simulated new node %s", p.Name, bestNew.name))
-			placed = true
 			continue
 		}
 
-		// 4c. Open a new simulated node
+		// 4c. Open a new simulated node only if the single worker template can fit the pod.
+		if pc.cpuMilli > e.NodeCPUCapacityMillicores || pc.memBytes > e.NodeMemoryCapacityBytes {
+			reason := fmt.Sprintf("pod requires %dm CPU / %d bytes RAM, exceeding the single worker template (%dm / %d bytes) and remaining existing-node free capacity",
+				pc.cpuMilli, pc.memBytes, e.NodeCPUCapacityMillicores, e.NodeMemoryCapacityBytes)
+			report.InfeasiblePods[p.Name] = reason
+			report.Explanations = append(report.Explanations, fmt.Sprintf("pod %s infeasible: %s", p.Name, reason))
+			continue
+		}
+
 		if !canPodFitConstraints(p, e.NodeLabels, e.NodeTaints) {
 			reason := "pod constraints (nodeSelector or taints) cannot be satisfied by worker template"
 			report.InfeasiblePods[p.Name] = reason
@@ -289,55 +294,20 @@ func (e *ResourceEstimator) EstimateDetailed(
 		report.PlacedPods[p.Name] = newNodeName
 		report.Explanations = append(report.Explanations,
 			fmt.Sprintf("pod %s opened new simulated node %s", p.Name, newNodeName))
-		placed = true
-		_ = placed
 	}
 
-	// Track initial available candidate capacity before bin-packing
-	var totalInitialFreeCPU, totalInitialFreeMem int64
-	for _, c := range candidates {
-		totalInitialFreeCPU += c.freeCPU
-		totalInitialFreeMem += c.freeMem
-	}
-
-	// ── 5. Compute shortfall ────────────────────────────────────────────────
-	var totalReqCPU, totalReqMem int64
-	for _, pc := range feasible {
-		totalReqCPU += pc.cpuMilli
-		totalReqMem += pc.memBytes
-	}
-	totalReqCPU += oversizedShortfallCPU
-	totalReqMem += oversizedShortfallMem
-
+	// ── 5. Remaining deficit = resources placed on new template nodes only ───
+	// Pods packed onto existing nodes must not contribute to Delta.
+	// Infeasible pods must not contribute to Delta (no endless scale-up).
 	var cpuShortfall, memShortfall int64
-	if len(openNewNodes) > 0 {
-		cpuShortfall = totalReqCPU - totalInitialFreeCPU
-		if cpuShortfall < 0 {
-			cpuShortfall = 0
-		}
-		memShortfall = totalReqMem - totalInitialFreeMem
-		if memShortfall < 0 {
-			memShortfall = 0
-		}
-
-		// If fragmented capacity required new simulated nodes despite aggregate free capacity,
-		// ensure the shortfall reflects the demand placed on new simulated nodes.
-		if cpuShortfall == 0 && memShortfall == 0 {
-			for _, n := range openNewNodes {
-				cpuShortfall += (e.NodeCPUCapacityMillicores - n.freeCPU)
-				memShortfall += (e.NodeMemoryCapacityBytes - n.freeMem)
-			}
-		}
-	} else if oversizedShortfallCPU > 0 || oversizedShortfallMem > 0 {
-		cpuShortfall = oversizedShortfallCPU - totalInitialFreeCPU
-		if cpuShortfall < 0 {
-			cpuShortfall = 0
-		}
-		memShortfall = oversizedShortfallMem - totalInitialFreeMem
-		if memShortfall < 0 {
-			memShortfall = 0
-		}
+	for _, n := range openNewNodes {
+		cpuShortfall += e.NodeCPUCapacityMillicores - n.freeCPU
+		memShortfall += e.NodeMemoryCapacityBytes - n.freeMem
 	}
+
+	report.Explanations = append(report.Explanations,
+		fmt.Sprintf("placed %dm CPU / %d bytes onto existing nodes; remaining deficit %dm CPU / %d bytes on %d new template node(s)",
+			consumedExistingCPU, consumedExistingMem, cpuShortfall, memShortfall, len(openNewNodes)))
 
 	report.Delta = ResourceDelta{
 		CPUMillicores: cpuShortfall,

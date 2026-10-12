@@ -67,10 +67,19 @@ func TestEstimate_OnePodFitsOneNode(t *testing.T) {
 	pods := []monitor.PodInfo{pendingPod("p1", 1000, 512)}
 
 	e := NewResourceEstimator()
-	delta := e.Estimate(state, pods)
+	report := e.EstimateDetailed(state, pods)
 
-	if delta.CPUMillicores != 0 || delta.MemoryBytes != 0 {
-		t.Errorf("expected zero shortfall, got cpu=%dm mem=%dB", delta.CPUMillicores, delta.MemoryBytes)
+	if report.Delta.CPUMillicores != 0 || report.Delta.MemoryBytes != 0 {
+		t.Errorf("expected zero shortfall, got cpu=%dm mem=%dB", report.Delta.CPUMillicores, report.Delta.MemoryBytes)
+	}
+	if report.NodesNeeded != 0 {
+		t.Errorf("expected NodesNeeded=0, got %d", report.NodesNeeded)
+	}
+	if report.PlacedPods["p1"] != "n1" {
+		t.Errorf("expected p1 on n1, got %q", report.PlacedPods["p1"])
+	}
+	if len(report.InfeasiblePods) != 0 {
+		t.Errorf("unexpected infeasible: %v", report.InfeasiblePods)
 	}
 }
 
@@ -91,7 +100,9 @@ func TestEstimate_SeveralPodsFitOneNode(t *testing.T) {
 }
 
 func TestEstimate_PodsRequireMultipleNodes(t *testing.T) {
-	// Node has 2 vCPU free; pods want 3 vCPU total → 1 vCPU shortfall.
+	// Node has 2000m free. Two 1500m pods: one packs on n1, one needs a new node.
+	// Remaining deficit must be 1500m (the unpacked pod), not totalReq - leftover
+	// free after mutation (which would incorrectly be 2500m).
 	state := makeState([]monitor.NodeInfo{readyNode("n1", 2000, 8192)})
 	pods := []monitor.PodInfo{
 		pendingPod("p1", 1500, 512),
@@ -99,58 +110,76 @@ func TestEstimate_PodsRequireMultipleNodes(t *testing.T) {
 	}
 
 	e := NewResourceEstimator()
-	delta := e.Estimate(state, pods)
+	report := e.EstimateDetailed(state, pods)
 
-	if delta.CPUMillicores <= 0 {
-		t.Errorf("expected CPU shortfall, got %d", delta.CPUMillicores)
+	if report.NodesNeeded != 1 {
+		t.Errorf("expected NodesNeeded=1, got %d", report.NodesNeeded)
+	}
+	if report.Delta.CPUMillicores != 1500 {
+		t.Errorf("expected remaining CPU deficit 1500m, got %d", report.Delta.CPUMillicores)
+	}
+	if report.Delta.MemoryBytes != 512*1024*1024 {
+		t.Errorf("expected remaining memory deficit 512MiB, got %d", report.Delta.MemoryBytes)
 	}
 }
 
 func TestEstimate_CPUBound(t *testing.T) {
-	// Node has plenty of memory but only 500m CPU free.
-	// Pods request 1000m CPU total → 500m shortfall.
+	// Node has plenty of memory but only 500m CPU free, so the 1000m pod cannot
+	// pack locally. Remaining deficit is the pod's full request on a new node.
 	state := makeState([]monitor.NodeInfo{busyNode("n1", 2000, 4096, 1500, 256)})
 	pods := []monitor.PodInfo{pendingPod("p1", 1000, 128)}
 
 	e := NewResourceEstimator()
-	delta := e.Estimate(state, pods)
+	report := e.EstimateDetailed(state, pods)
 
-	if delta.CPUMillicores <= 0 {
-		t.Errorf("expected CPU shortfall, got %d", delta.CPUMillicores)
+	if report.NodesNeeded != 1 {
+		t.Errorf("expected NodesNeeded=1, got %d", report.NodesNeeded)
 	}
-	// Memory: 4096-256 = 3840 MiB free, pod wants 128 MiB → no memory shortfall.
-	if delta.MemoryBytes != 0 {
-		t.Errorf("expected zero memory shortfall, got %d bytes", delta.MemoryBytes)
+	if report.Delta.CPUMillicores != 1000 {
+		t.Errorf("expected CPU deficit 1000m, got %d", report.Delta.CPUMillicores)
+	}
+	if report.Delta.MemoryBytes != 128*1024*1024 {
+		t.Errorf("expected memory deficit 128MiB on the new node, got %d", report.Delta.MemoryBytes)
 	}
 }
 
 func TestEstimate_MemoryBound(t *testing.T) {
-	// Node has plenty of CPU but only 128 MiB memory free.
-	// Pod requests 512 MiB → 384 MiB shortfall.
+	// Node has plenty of CPU but only 128 MiB memory free, so the 512 MiB pod
+	// cannot pack locally. Remaining deficit is the pod's full request.
 	state := makeState([]monitor.NodeInfo{busyNode("n1", 4000, 2048, 100, 1920)})
 	pods := []monitor.PodInfo{pendingPod("p1", 100, 512)}
 
 	e := NewResourceEstimator()
-	delta := e.Estimate(state, pods)
+	report := e.EstimateDetailed(state, pods)
 
-	if delta.CPUMillicores != 0 {
-		t.Errorf("expected zero CPU shortfall, got %d", delta.CPUMillicores)
+	if report.NodesNeeded != 1 {
+		t.Errorf("expected NodesNeeded=1, got %d", report.NodesNeeded)
 	}
-	if delta.MemoryBytes <= 0 {
-		t.Errorf("expected memory shortfall, got %d bytes", delta.MemoryBytes)
+	if report.Delta.CPUMillicores != 100 {
+		t.Errorf("expected CPU deficit 100m (placed on new node), got %d", report.Delta.CPUMillicores)
+	}
+	if report.Delta.MemoryBytes != 512*1024*1024 {
+		t.Errorf("expected memory deficit 512MiB, got %d", report.Delta.MemoryBytes)
 	}
 }
 
 func TestEstimate_PodLargerThanAnyNode(t *testing.T) {
-	// Pod requests 8 vCPU; node only has 2 vCPU.
+	// Pod requests 8 vCPU; existing node and the single 2 vCPU template cannot fit it.
+	// Must be infeasible with zero Delta so the controller does not provision forever.
 	state := makeState([]monitor.NodeInfo{readyNode("n1", 2000, 4096)})
 	pods := []monitor.PodInfo{pendingPod("p1", 8000, 512)}
 
 	e := NewResourceEstimator()
-	delta := e.Estimate(state, pods)
+	report := e.EstimateDetailed(state, pods)
 
-	if delta.CPUMillicores <= 0 {
-		t.Errorf("expected CPU shortfall for oversized pod, got %d", delta.CPUMillicores)
+	if report.InfeasiblePods["p1"] == "" {
+		t.Fatal("oversized pod must be marked infeasible")
+	}
+	if report.NodesNeeded != 0 {
+		t.Errorf("expected NodesNeeded=0, got %d", report.NodesNeeded)
+	}
+	if !report.Delta.IsZero() {
+		t.Errorf("infeasible pod must not contribute to Delta, got %+v", report.Delta)
 	}
 }
 
@@ -261,6 +290,7 @@ func TestEstimate_AllocatableVsCapacity(t *testing.T) {
 	pods := []monitor.PodInfo{pendingPod("p1", 2500, 256)} // 2500m request
 
 	e := NewResourceEstimator()
+	e.NodeCPUCapacityMillicores = 4000 // worker template large enough to host the pod
 	delta := e.Estimate(state, pods)
 
 	if delta.CPUMillicores <= 0 {
@@ -289,16 +319,19 @@ func TestEstimate_MultipleNodesTotalCapacity(t *testing.T) {
 }
 
 func TestEstimate_ExistingUsedResourcesDeducted(t *testing.T) {
-	// Node has 4 vCPU allocatable, 3.5 vCPU already used.
-	// Only 500m free; pod requests 600m → shortfall of 100m.
+	// Node has 4 vCPU allocatable, 3.5 vCPU already used (500m free).
+	// Pod requests 600m → cannot pack locally; remaining deficit is 600m.
 	state := makeState([]monitor.NodeInfo{busyNode("n1", 4000, 8192, 3500, 512)})
 	pods := []monitor.PodInfo{pendingPod("p1", 600, 256)}
 
 	e := NewResourceEstimator()
-	delta := e.Estimate(state, pods)
+	report := e.EstimateDetailed(state, pods)
 
-	if delta.CPUMillicores <= 0 {
-		t.Errorf("expected CPU shortfall after deducting used resources, got %d", delta.CPUMillicores)
+	if report.NodesNeeded != 1 {
+		t.Errorf("expected NodesNeeded=1, got %d", report.NodesNeeded)
+	}
+	if report.Delta.CPUMillicores != 600 {
+		t.Errorf("expected remaining CPU deficit 600m, got %d", report.Delta.CPUMillicores)
 	}
 }
 
@@ -441,5 +474,121 @@ func TestEstimateDetailed_ExplainabilityReport(t *testing.T) {
 	}
 	if len(report.Explanations) == 0 {
 		t.Error("Explanations should contain step-by-step reasoning")
+	}
+}
+
+func TestEstimate_SeveralPodsFitAcrossExistingNodes_NoOverProvision(t *testing.T) {
+	state := makeState([]monitor.NodeInfo{
+		readyNode("n1", 2000, 4096),
+		readyNode("n2", 2000, 4096),
+	})
+	pods := []monitor.PodInfo{
+		pendingPod("p1", 1800, 256),
+		pendingPod("p2", 1800, 256),
+		pendingPod("p3", 200, 128),
+	}
+
+	e := NewResourceEstimator()
+	report := e.EstimateDetailed(state, pods)
+
+	if report.NodesNeeded != 0 {
+		t.Errorf("pods should pack on existing nodes, NodesNeeded=%d", report.NodesNeeded)
+	}
+	if !report.Delta.IsZero() {
+		t.Errorf("expected zero remaining deficit, got %+v", report.Delta)
+	}
+	if len(report.PlacedPods) != 3 {
+		t.Errorf("expected 3 placed pods, got %v", report.PlacedPods)
+	}
+}
+
+func TestEstimate_SchedulingIncompatibleNodeNotUsable(t *testing.T) {
+	node := readyNode("tainted", 8000, 16384)
+	node.Taints = []corev1.Taint{
+		{Key: "dedicated", Value: "gpu", Effect: corev1.TaintEffectNoSchedule},
+	}
+	state := makeState([]monitor.NodeInfo{node})
+	pod := pendingPod("p1", 500, 256) // no toleration
+
+	e := NewResourceEstimator()
+	report := e.EstimateDetailed(state, []monitor.PodInfo{pod})
+
+	if report.PlacedPods["p1"] == "tainted" {
+		t.Fatal("incompatible node must not contribute usable capacity")
+	}
+	if report.NodesNeeded != 1 {
+		t.Errorf("pod should open a template node, NodesNeeded=%d", report.NodesNeeded)
+	}
+	if report.Delta.CPUMillicores != 500 {
+		t.Errorf("expected 500m remaining deficit, got %d", report.Delta.CPUMillicores)
+	}
+}
+
+func TestEstimate_OversizedFitsLargerExistingNode(t *testing.T) {
+	// Template is 2000m, but an existing node has 8000m free. The 5000m pod
+	// must pack locally and must not be marked infeasible.
+	state := makeState([]monitor.NodeInfo{readyNode("big", 8000, 16384)})
+	pods := []monitor.PodInfo{pendingPod("p-big", 5000, 512)}
+
+	e := NewResourceEstimator()
+	report := e.EstimateDetailed(state, pods)
+
+	if report.PlacedPods["p-big"] != "big" {
+		t.Errorf("expected placement on existing large node, got %q", report.PlacedPods["p-big"])
+	}
+	if report.InfeasiblePods["p-big"] != "" {
+		t.Errorf("pod that fits an existing node must not be infeasible: %s", report.InfeasiblePods["p-big"])
+	}
+	if report.NodesNeeded != 0 || !report.Delta.IsZero() {
+		t.Errorf("no scale-up: NodesNeeded=%d delta=%+v", report.NodesNeeded, report.Delta)
+	}
+}
+
+func TestEstimate_MixedFeasibleAndInfeasible(t *testing.T) {
+	state := makeState(nil)
+	ok := pendingPod("ok", 1000, 256)
+	bad := pendingPod("bad", 9000, 256)
+	unsupported := pendingPod("anti", 500, 256)
+	unsupported.HasUnsupportedConstraints = true
+	unsupported.UnsupportedReason = "podAntiAffinity is unsupported"
+
+	e := NewResourceEstimator()
+	report := e.EstimateDetailed(state, []monitor.PodInfo{ok, bad, unsupported})
+
+	if report.NodesNeeded != 1 {
+		t.Errorf("only the feasible pod should open a node, NodesNeeded=%d", report.NodesNeeded)
+	}
+	if report.Delta.CPUMillicores != 1000 {
+		t.Errorf("Delta must equal feasible remaining demand 1000m, got %d", report.Delta.CPUMillicores)
+	}
+	if report.InfeasiblePods["bad"] == "" || report.InfeasiblePods["anti"] == "" {
+		t.Errorf("both infeasible pods must be recorded: %v", report.InfeasiblePods)
+	}
+	if report.PlacedPods["ok"] == "" {
+		t.Error("feasible pod must be placed")
+	}
+}
+
+func TestEstimate_EmptyClusterExactDeficit(t *testing.T) {
+	state := makeState(nil)
+	pods := []monitor.PodInfo{
+		pendingPod("a", 600, 256),
+		pendingPod("b", 600, 256),
+		pendingPod("c", 600, 256),
+	}
+	e := NewResourceEstimator()
+	report := e.EstimateDetailed(state, pods)
+
+	if report.NodesNeeded != 1 {
+		t.Errorf("3x600m should pack on one 2000m template node, got %d", report.NodesNeeded)
+	}
+	if report.Delta.CPUMillicores != 1800 {
+		t.Errorf("Delta CPU want 1800, got %d", report.Delta.CPUMillicores)
+	}
+	if report.Delta.MemoryBytes != 3*256*1024*1024 {
+		t.Errorf("Delta mem want 768MiB, got %d", report.Delta.MemoryBytes)
+	}
+	if len(report.InfeasiblePods) != 0 {
+		t.Errorf("unexpected infeasible: %v", report.InfeasiblePods)
 	}
 }
